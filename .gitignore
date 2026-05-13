@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.upnp-cache.json
+.upnp-cache.json.bad
+.upnp-cache.json.tmp
