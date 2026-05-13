@@ -125,10 +125,16 @@ def ssdp_msearch(
     st: str = SSDP_ST_IGD,
 ) -> list[dict[str, str]]:
     """Send a unicast SSDP M-SEARCH to host:1900 and return parsed responses.
-    Returns an empty list on timeout (no exception)."""
+    Returns an empty list on timeout (no exception).
+
+    Note: HOST is the multicast SSDP address rather than the unicast
+    destination. UPnP 1.0 allowed either, but UPnP 2.0 requires the
+    multicast address and many responders (e.g. miniupnpd on DD-WRT)
+    silently drop M-SEARCH packets that carry the unicast IP in HOST.
+    """
     msg = (
         "M-SEARCH * HTTP/1.1\r\n"
-        f"HOST: {host}:{SSDP_PORT}\r\n"
+        f"HOST: {SSDP_ADDR}:{SSDP_PORT}\r\n"
         'MAN: "ssdp:discover"\r\n'
         f"MX: {mx}\r\n"
         f"ST: {st}\r\n"
