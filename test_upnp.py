@@ -250,6 +250,28 @@ class TestSoapEnvelope(unittest.TestCase):
         self.assertIn("a &amp; b &lt;c&gt;", env)
         self.assertNotIn("a & b <c>", env)
 
+    def test_envelope_elements_are_crlf_separated(self):
+        # Carrier IGDs like Zhiyun-IGD reject single-line envelopes.
+        # Every major element must end with CRLF.
+        env = upnp.build_soap_envelope(
+            service_type="urn:schemas-upnp-org:service:WANIPConnection:1",
+            action="AddPortMapping",
+            args={"NewRemoteHost": "", "NewExternalPort": "60010"},
+        )
+        for fragment in (
+            "?>\r\n",
+            'encoding/">\r\n',
+            "<s:Body>\r\n",
+            '<u:AddPortMapping xmlns:u="urn:schemas-upnp-org:service:'
+            'WANIPConnection:1">\r\n',
+            "<NewRemoteHost></NewRemoteHost>\r\n",
+            "<NewExternalPort>60010</NewExternalPort>\r\n",
+            "</u:AddPortMapping>\r\n",
+            "</s:Body>\r\n",
+            "</s:Envelope>\r\n",
+        ):
+            self.assertIn(fragment, env, f"missing CRLF after: {fragment!r}")
+
 
 class TestSoapResponse(unittest.TestCase):
     def test_parses_success(self):

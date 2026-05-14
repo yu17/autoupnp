@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import socket
 import subprocess
 import sys
 import time
-import urllib.error
-import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -247,18 +246,37 @@ def find_wan_service(rd: RootDesc) -> ServiceInfo:
 def fetch_url(url: str, timeout: float = 5.0, data: bytes | None = None,
               headers: dict[str, str] | None = None,
               method: str | None = None) -> tuple[int, bytes, dict[str, str]]:
-    """Fetch a URL via urllib. Returns (status, body, headers).
-    Does not raise on HTTP errors — caller decides what to do with 4xx/5xx."""
-    req = urllib.request.Request(url, data=data, method=method)
-    for k, v in (headers or {}).items():
-        req.add_header(k, v)
+    """Fetch a URL via http.client. Returns (status, body, headers).
+    Does not raise on HTTP errors — caller decides what to do with 4xx/5xx.
+
+    Uses http.client rather than urllib.request because the latter
+    unconditionally injects `Connection: close` and a Python-urllib
+    User-Agent into the request, and some carrier UPnP IGDs (observed:
+    "Zhiyun-IGD") respond with HTTP 400 to such requests even though
+    the SOAP body is well-formed. http.client only adds Host,
+    Content-Length, and Accept-Encoding — every other header is ours.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"unsupported URL scheme: {parsed.scheme!r}")
+
+    cls = (http.client.HTTPSConnection if parsed.scheme == "https"
+           else http.client.HTTPConnection)
+    conn = cls(parsed.netloc, timeout=timeout)
+
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+    if method is None:
+        method = "POST" if data is not None else "GET"
+
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            body = resp.read()
-            return resp.status, body, dict(resp.headers.items())
-    except urllib.error.HTTPError as e:
-        body = e.read() if hasattr(e, "read") else b""
-        return e.code, body, dict(e.headers.items()) if e.headers else {}
+        conn.request(method, path, body=data, headers=headers or {})
+        resp = conn.getresponse()
+        body = resp.read()
+        return resp.status, body, dict(resp.getheaders())
+    finally:
+        conn.close()
 
 
 def fetch_root_desc(url: str, timeout: float = 5.0) -> RootDesc:
@@ -271,20 +289,27 @@ def fetch_root_desc(url: str, timeout: float = 5.0) -> RootDesc:
 
 def build_soap_envelope(service_type: str, action: str,
                         args: dict[str, str]) -> str:
-    """Build a SOAP 1.1 envelope for a UPnP action."""
+    """Build a SOAP 1.1 envelope for a UPnP action.
+
+    Elements are CRLF-separated. miniupnpd accepts compact envelopes,
+    but some carrier IGDs (observed: "Zhiyun-IGD") return HTTP 400
+    when the body is one long line. CRLF between elements matches
+    miniupnpc's wire format and is accepted everywhere we have tested.
+    """
     arg_xml = "".join(
-        f"<{name}>{xml_escape(str(value))}</{name}>"
+        f"<{name}>{xml_escape(str(value))}</{name}>\r\n"
         for name, value in args.items()
     )
     return (
-        '<?xml version="1.0"?>\n'
+        '<?xml version="1.0"?>\r\n'
         '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"'
-        ' s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">'
-        "<s:Body>"
-        f'<u:{action} xmlns:u="{service_type}">'
+        ' s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">\r\n'
+        "<s:Body>\r\n"
+        f'<u:{action} xmlns:u="{service_type}">\r\n'
         f"{arg_xml}"
-        f"</u:{action}>"
-        "</s:Body></s:Envelope>"
+        f"</u:{action}>\r\n"
+        "</s:Body>\r\n"
+        "</s:Envelope>\r\n"
     )
 
 
@@ -609,6 +634,17 @@ def cmd_status(args: argparse.Namespace) -> int:
                 {"NewPortMappingIndex": str(idx)})
         except SoapFault as e:
             if e.code in (713, 402):  # SpecifiedArrayIndexInvalid / Invalid Args
+                break
+            if e.code == 401 and idx == 0:
+                # Invalid Action: this router doesn't expose
+                # GetGenericPortMappingEntry at all. Some carrier IGDs
+                # (e.g. Zhiyun-IGD) implement only the Add/Delete/Specific
+                # primitives. Treat as "no enumeration available" rather
+                # than a hard error; the mapping list will be empty.
+                sys.stderr.write(
+                    "warning: GetGenericPortMappingEntry not supported by "
+                    "this router; mapping list will be empty\n"
+                )
                 break
             sys.stderr.write(f"error: GetGenericPortMappingEntry: {e}\n")
             return 1
