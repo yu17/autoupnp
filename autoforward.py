@@ -3,13 +3,20 @@
 
 Discovers the inner router (default gateway), reads its WAN IP via
 GetExternalIPAddress, locates the outer router via traceroute hop 2,
-diffs the default preset against what is already forwarded on the
-outer router, and applies only the missing entries — with destination
-pointing back to the inner router's WAN IP.
+checks each desired mapping on the outer router via
+GetSpecificPortMappingEntry, and applies only the missing or stale
+entries — with destination pointing back to the inner router's WAN IP.
 
 Cron-safe: idempotent in the steady state, exit 0 only when every
-desired mapping is in place. Calls upnp.py as a subprocess and consumes
-its --json output, so it stays decoupled from upnp.py's internals.
+desired mapping is in place.
+
+This script uses upnp.py two ways: as a subprocess (for discover and
+forward, where --json output keeps the boundary clean), and as an
+imported module (for the per-port GetSpecificPortMappingEntry check).
+The direct-call path is required because some carrier routers
+(observed: Zhiyun-IGD) don't implement GetGenericPortMappingEntry and
+return UPnPError 401 to upnp.py status, so the bulk-diff approach
+doesn't work against them.
 """
 from __future__ import annotations
 
@@ -21,6 +28,11 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 UPNP_CMD = [sys.executable, str(SCRIPT_DIR / "upnp.py")]
+
+# Make upnp.py importable as a module so we can call its SOAP layer
+# directly for the per-port check below.
+sys.path.insert(0, str(SCRIPT_DIR))
+import upnp  # noqa: E402
 
 
 def run_upnp(subcommand: str, *args: str) -> dict:
@@ -59,10 +71,7 @@ def find_outer_router_ip() -> str:
 
 
 def desired_mappings(internal_ip: str) -> list[dict]:
-    """Expand upnp.py's default preset into desired (proto, port, client) dicts."""
-    sys.path.insert(0, str(SCRIPT_DIR))
-    import upnp  # noqa: E402
-
+    """Expand upnp.py's default preset into desired-mapping dicts."""
     pairs = upnp.expand_port_specs(upnp.PRESETS["default"], default_proto="both")
     return [
         {
@@ -75,15 +84,50 @@ def desired_mappings(internal_ip: str) -> list[dict]:
     ]
 
 
-def is_present(desired: dict, current: list[dict]) -> bool:
-    """A mapping is present iff all four routing fields match exactly."""
-    return any(
-        m["protocol"] == desired["protocol"]
-        and m["external_port"] == desired["external_port"]
-        and m["internal_client"] == desired["internal_client"]
-        and m["internal_port"] == desired["internal_port"]
-        for m in current
+def service_from_cache(host: str) -> upnp.ServiceInfo:
+    """Reconstruct a ServiceInfo from the on-disk discovery cache.
+    Requires `discover` to have been run already for this host."""
+    entry = upnp.cache_get(upnp.CACHE_PATH, host)
+    if not entry:
+        raise RuntimeError(
+            f"{host!r} not in discovery cache; run `upnp.py discover {host}` first"
+        )
+    return upnp.ServiceInfo(
+        service_type=entry["service_type"],
+        service_id="",
+        control_url=entry["control_url"],
+        scpd_url="",
     )
+
+
+def check_mapping(svc: upnp.ServiceInfo, desired: dict,
+                  timeout: float = 5.0) -> str:
+    """Classify one desired mapping as 'present', 'absent', or 'stale'.
+
+    Uses GetSpecificPortMappingEntry rather than enumerating with
+    GetGenericPortMappingEntry, because the latter is not implemented
+    by every IGD (e.g. Zhiyun-IGD returns 401 Invalid Action).
+
+    Compares NewInternalClient only — NewInternalPort cannot be trusted
+    on routers that byte-swap it in the response (observed on
+    Zhiyun-IGD: a port-60010 mapping reads back as 27370,
+    0xEA6A ↔ 0x6AEA). Our preset always sets external_port ==
+    internal_port, so a client match is sufficient to identify our
+    mapping.
+    """
+    try:
+        resp = upnp.soap_call(svc, "GetSpecificPortMappingEntry", {
+            "NewRemoteHost": "",
+            "NewExternalPort": str(desired["external_port"]),
+            "NewProtocol": desired["protocol"],
+        }, timeout=timeout)
+    except upnp.SoapFault as e:
+        if e.code == 714:  # NoSuchEntryInArray — spec-compliant "absent"
+            return "absent"
+        raise
+    if resp.get("NewInternalClient") == desired["internal_client"]:
+        return "present"
+    return "stale"
 
 
 def main() -> int:
@@ -107,22 +151,40 @@ def main() -> int:
     print(f"  model:       {outer['model_name']}")
     print(f"  rootDesc:    {outer['root_desc_url']}")
 
-    outer_status = run_upnp("status", "--host", outer_ip)
-    print(f"  external IP: {outer_status['external_ip']}")
-    print(f"  mappings:    {len(outer_status['mappings'])} currently registered")
+    outer_svc = service_from_cache(outer_ip)
+    try:
+        ext = upnp.soap_call(outer_svc, "GetExternalIPAddress", {}, timeout=5.0)
+        print(f"  external IP: {ext.get('NewExternalIPAddress', '?')}")
+    except (upnp.SoapFault, RuntimeError) as e:
+        print(f"  external IP: (lookup failed: {e})")
 
     desired = desired_mappings(inner_wan_ip)
-    missing = [d for d in desired if not is_present(d, outer_status["mappings"])]
+    to_apply: list[dict] = []
+    counts = {"present": 0, "absent": 0, "stale": 0}
+    for d in desired:
+        try:
+            state = check_mapping(outer_svc, d)
+        except upnp.SoapFault as e:
+            sys.stderr.write(
+                f"error: GetSpecificPortMappingEntry "
+                f"{d['protocol']} {d['external_port']}: {e}\n"
+            )
+            return 1
+        counts[state] += 1
+        if state != "present":
+            to_apply.append(d)
+
     print("\n== Plan ==")
     print(f"  desired: {len(desired)}")
-    print(f"  present: {len(desired) - len(missing)}")
-    print(f"  missing: {len(missing)}")
+    print(f"  present: {counts['present']}")
+    print(f"  absent:  {counts['absent']}")
+    print(f"  stale:   {counts['stale']}")
 
-    if not missing:
+    if not to_apply:
         print("\nAll desired mappings already in place.")
         return 0
 
-    specs = [f"{m['external_port']}/{m['protocol'].lower()}" for m in missing]
+    specs = [f"{d['external_port']}/{d['protocol'].lower()}" for d in to_apply]
     print(f"\n== Applying {len(specs)} mapping(s) ==")
     result = run_upnp(
         "forward",
